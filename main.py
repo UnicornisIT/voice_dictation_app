@@ -34,9 +34,14 @@ APP_ICON_FILE = "app_icon.ico"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "float32"
+MAX_PENDING_TRANSCRIPTION_CHUNKS = 1
 
-APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / APP_NAME
-APP_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / APP_NAME
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    APP_DIR = Path(tempfile.gettempdir()) / APP_NAME
+    APP_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = APP_DIR / "app.log"
 SETTINGS_FILE = APP_DIR / "settings.json"
 AUTOSAVE_FILE = APP_DIR / "autosave_transcript.txt"
@@ -68,12 +73,21 @@ def set_windows_app_id() -> None:
     except Exception:
         logging.exception("Failed to set Windows AppUserModelID")
 
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    encoding="utf-8",
-)
+try:
+    logging.basicConfig(
+        filename=str(LOG_FILE),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        encoding="utf-8",
+    )
+except OSError:
+    LOG_FILE = Path(tempfile.gettempdir()) / f"{APP_NAME}.log"
+    logging.basicConfig(
+        filename=str(LOG_FILE),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        encoding="utf-8",
+    )
 
 FILLER_WORDS_RU = [
     "ну", "как бы", "типа", "это самое", "значит", "короче", "в общем", "собственно",
@@ -164,6 +178,15 @@ def is_model_downloaded(model_size: str) -> bool:
         and (model_dir / "config.json").exists()
         and any((model_dir / name).exists() for name in ("model.bin", "model.bin.index.json"))
     )
+
+
+def cuda_is_available() -> bool:
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        logging.exception("Failed to check CUDA availability")
+        return False
 
 
 def human_kb(value: int) -> str:
@@ -500,12 +523,69 @@ class TranscriberWorker(QObject):
         self._queue: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._model = None
+        self._model_runtime = ""
+
+    def _discard_pending_chunks(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                old_path = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                os.remove(old_path)
+                logging.info("Dropped pending audio chunk: %s", old_path)
+            except OSError:
+                logging.exception("Failed to remove pending audio chunk: %s", old_path)
+            dropped += 1
+        return dropped
 
     def enqueue(self, wav_path: str):
+        # Распознавание может быть медленнее записи, особенно на CPU.
+        # Ограничиваем очередь: старые фрагменты уже менее актуальны для живой диктовки
+        # и иначе будут бесконечно копиться, нагружая CPU/диск и задерживая текст.
+        while self._queue.qsize() >= MAX_PENDING_TRANSCRIPTION_CHUNKS:
+            try:
+                old_path = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                os.remove(old_path)
+                logging.info("Dropped stale audio chunk from transcription queue: %s", old_path)
+            except OSError:
+                logging.exception("Failed to remove stale audio chunk: %s", old_path)
         self._queue.put(wav_path)
 
-    def request_stop(self):
+    def request_stop(self, drop_pending: bool = False):
         self._stop.set()
+        if drop_pending:
+            # При закрытии или повторной остановке важнее быстро завершить поток,
+            # чем дообрабатывать устаревшие WAV-фрагменты в фоне.
+            dropped = self._discard_pending_chunks()
+            if dropped:
+                logging.info("Dropped %d queued chunks during transcription stop", dropped)
+
+    def _load_model(self, WhisperModel, model_path: Path):
+        if cuda_is_available():
+            for compute_type in ("int8_float16", "float16"):
+                try:
+                    self.status.emit(f"Загрузка модели на CUDA ({compute_type})")
+                    model = WhisperModel(str(model_path), device="cuda", compute_type=compute_type)
+                    logging.info("Faster-Whisper model initialized on CUDA with %s", compute_type)
+                    return model, f"CUDA {compute_type}"
+                except Exception:
+                    # На части систем CUDA видна, но конкретный compute_type или runtime
+                    # может не стартовать. Тогда пробуем более простой CUDA-режим,
+                    # а затем откатываемся на CPU, чтобы приложение работало без видеокарты.
+                    logging.exception("Failed to initialize Faster-Whisper on CUDA with %s", compute_type)
+
+            self.status.emit("CUDA не запустилась, fallback на CPU int8")
+            logging.warning("CUDA initialization failed, falling back to CPU int8")
+
+        self.status.emit("Загрузка модели на CPU (int8)")
+        model = WhisperModel(str(model_path), device="cpu", compute_type="int8")
+        logging.info("Faster-Whisper model initialized on CPU with int8")
+        return model, "CPU int8"
 
     def _ensure_model(self):
         if self._model is not None:
@@ -519,9 +599,8 @@ class TranscriberWorker(QObject):
                     "Запустите диктовку повторно и дождитесь окна загрузки модели."
                 )
             self.status.emit(f"Загрузка модели {model_size} в память")
-            # int8 работает на CPU и снижает требования к памяти. CUDA можно включить вручную ниже.
-            self._model = WhisperModel(str(model_local_dir(model_size)), device="cpu", compute_type="int8")
-            self.model_ready.emit(f"Модель загружена: {model_size}")
+            self._model, self._model_runtime = self._load_model(WhisperModel, model_local_dir(model_size))
+            self.model_ready.emit(f"Модель загружена: {model_size} ({self._model_runtime})")
         except Exception as exc:
             logging.exception("Failed to load Whisper model")
             raise RuntimeError(
@@ -542,13 +621,18 @@ class TranscriberWorker(QObject):
                     language = None if self.settings.language == "auto" else self.settings.language
                     # Для коротких чанков condition_on_previous_text=True часто даёт "прилипание"
                     # и повторение старого контекста. Для диктовки по фрагментам надёжнее False.
-                    vad_filter = False
-                    beam_size = 1 if self.settings.accuracy_mode == "fast" else 3
+                    # beam_size=1 заметно снижает задержку для потоковой диктовки; более широкий
+                    # поиск повышает нагрузку и легко создаёт хвост из необработанных WAV.
+                    beam_size = 1
+                    # VAD отбрасывает паузы и тишину до тяжёлого распознавания, чтобы модель
+                    # не тратила время на пустые участки и очередь не росла без пользы.
+                    vad_filter = True
                     segments, info = self._model.transcribe(
                         wav_path,
                         language=language,
                         beam_size=beam_size,
                         vad_filter=vad_filter,
+                        vad_parameters=dict(min_silence_duration_ms=500),
                         condition_on_previous_text=False,
                         temperature=0.0,
                         no_speech_threshold=0.65,
@@ -607,6 +691,8 @@ class MainWindow(QMainWindow):
         self.paused = False
         self._pending_start_after_download = False
         self._recorder_started = False
+        self._stopping = False
+        self._closing_after_stop = False
 
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self.autosave)
@@ -831,7 +917,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Микрофон", f"Не удалось получить список микрофонов: {exc}")
 
     def start_dictation(self):
-        if self.rec_thread is not None:
+        if self.rec_thread is not None or self.tr_thread is not None or self._stopping:
             return
         self.on_settings_changed()
         if self.settings.microphone_index is None:
@@ -870,6 +956,7 @@ class MainWindow(QMainWindow):
         self.tr_worker.error.connect(self.show_error)
         self.tr_worker.model_ready.connect(self._start_recorder_after_model_loaded)
         self.tr_worker.finished.connect(self.tr_thread.quit)
+        self.tr_worker.finished.connect(self._on_transcriber_finished)
         self.tr_worker.finished.connect(self.tr_worker.deleteLater)
         self.tr_thread.finished.connect(self.tr_thread.deleteLater)
         self.tr_thread.start()
@@ -900,6 +987,8 @@ class MainWindow(QMainWindow):
         return False
 
     def _set_status_safely(self, msg: str):
+        if self._stopping and msg not in ("Ожидание", "Завершение распознавания"):
+            return
         # Не даём фоновому распознавателю показывать «Ожидание», пока запись реально идёт.
         if msg == "Ожидание" and self.rec_worker is not None:
             return
@@ -928,6 +1017,7 @@ class MainWindow(QMainWindow):
         self.rec_worker.warning.connect(self.show_warning)
         self.rec_worker.error.connect(self.show_error)
         self.rec_worker.finished.connect(self.rec_thread.quit)
+        self.rec_worker.finished.connect(self._on_recorder_finished)
         self.rec_worker.finished.connect(self.rec_worker.deleteLater)
         self.rec_thread.finished.connect(self.rec_thread.deleteLater)
         self.rec_thread.start()
@@ -945,33 +1035,71 @@ class MainWindow(QMainWindow):
         if self.rec_worker is None and self.tr_worker is None:
             self.status_label.setText("Ожидание")
             return
+        if self._stopping:
+            return
 
-        self.status_label.setText("Обработка оставшегося аудио")
+        self._stopping = True
+        self.status_label.setText("Остановка записи")
+        self.warning_label.setText("")
+        self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.btn_pause.setEnabled(False)
 
+        # Не вызываем QThread.wait() из UI-потока: пока Faster-Whisper завершает
+        # текущий transcribe(), Windows считает неподвижное окно зависшим.
+        # Вместо этого просим потоки остановиться и ждём их finished-сигналы.
         if self.rec_worker:
             self.rec_worker.request_stop()
-        if self.rec_thread:
-            self.rec_thread.wait(8000)
+        else:
+            self._request_transcriber_stop(drop_pending=True)
+        self._finish_stop_if_done()
 
+    def _request_transcriber_stop(self, drop_pending: bool = False):
+        if self.tr_worker:
+            self.status_label.setText("Завершение распознавания")
+            self.tr_worker.request_stop(drop_pending=drop_pending)
+
+    def _on_recorder_finished(self):
         self.rec_worker = None
         self.rec_thread = None
+        self._recorder_started = False
+        if not self._stopping:
+            self._stopping = True
+        # После остановки микрофона новых WAV уже не будет. Разрешаем распознавателю
+        # обработать максимум оставшийся актуальный фрагмент и затем завершиться.
+        self._request_transcriber_stop(drop_pending=self._closing_after_stop)
+        self._finish_stop_if_done()
 
-        if self.tr_worker:
-            self.tr_worker.request_stop()
-        if self.tr_thread:
-            self.tr_thread.wait(60000)
-
+    def _on_transcriber_finished(self):
         self.tr_worker = None
         self.tr_thread = None
+        if self.rec_worker is not None and not self._stopping:
+            self._stopping = True
+            self.status_label.setText("Остановка записи")
+            self.rec_worker.request_stop()
+            return
+        self._finish_stop_if_done()
+
+    def _reset_idle_controls(self):
+        self._stopping = False
         self._recorder_started = False
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.btn_pause.setText("Пауза")
+
+    def _finish_stop_if_done(self):
+        if self.rec_worker is not None or self.tr_worker is not None:
+            return
+        if not self._stopping:
+            self._reset_idle_controls()
+            return
+        self._reset_idle_controls()
         self.status_label.setText("Ожидание")
         self.autosave()
+        if self._closing_after_stop:
+            self._closing_after_stop = False
+            self.close()
 
     def on_audio_ready_debug(self, wav_path: str, db: float):
         logging.info("Audio chunk ready: %s, level %.1f dB", wav_path, db)
@@ -993,6 +1121,9 @@ class MainWindow(QMainWindow):
         logging.warning(msg)
 
     def show_error(self, msg: str):
+        if self._closing_after_stop or self._stopping:
+            logging.error(msg)
+            return
         self.status_label.setText("Ошибка микрофона" if "микроф" in msg.lower() else "Ожидание")
         logging.error(msg)
         QMessageBox.warning(self, "Ошибка", msg)
@@ -1076,10 +1207,17 @@ class MainWindow(QMainWindow):
             self.history_list.addItem(item)
 
     def closeEvent(self, event):
-        try:
-            self.stop_dictation()
-        except Exception:
-            pass
+        if self.rec_worker is not None or self.tr_worker is not None or self._stopping:
+            self._closing_after_stop = True
+            try:
+                if not self._stopping:
+                    self.stop_dictation()
+                elif self.tr_worker:
+                    self._request_transcriber_stop(drop_pending=True)
+            except Exception:
+                logging.exception("Failed to request stop while closing")
+            event.ignore()
+            return
         self.on_settings_changed()
         self.autosave()
         try:
