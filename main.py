@@ -29,7 +29,7 @@ from docx.shared import Pt
 APP_NAME = "VoiceDictationSTT"
 DEVELOPER_NAME = "UnicornisIT"
 TELEGRAM_CHANNEL = "https://t.me/unicornis_pulse"
-DEVELOPER_EMAIL = "earov18@gmail.com"
+DEVELOPER_EMAIL = "dev-eva@outlook.com"
 APP_ICON_FILE = "app_icon.ico"
 SAMPLE_RATE = 16000
 CHANNELS = 1
